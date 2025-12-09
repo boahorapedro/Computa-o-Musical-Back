@@ -21,7 +21,7 @@ numpy==1.26.3
 soundfile==0.12.1
 demucs==4.0.1
 torch
-torchaudio==2.1.2
+torchaudio
 
 # Storage
 minio==7.2.3
