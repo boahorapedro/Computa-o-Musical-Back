@@ -1,0 +1,1854 @@
+# Plano Simplificado: Backend de Mixagem de Áudio
+
+---
+
+## 1. Resumo Executivo
+
+### 1.1 Objetivo
+
+Transformar o Jupyter Notebook de processamento de áudio em um backend funcional que permita:
+- Upload de músicas e sons de estilo
+- Separação automática de stems (vocais, bateria, baixo, outros)
+- Síntese granular com mapeamento de pitch
+- Mixagem personalizada via API
+
+### 1.2 Componentes do Notebook Identificados
+
+| Componente | Função | Complexidade |
+|------------|--------|--------------|
+| Demucs (htdemucs_ft) | Separação de stems | Alta (GPU) |
+| Librosa onset_detect | Detecção de eventos rítmicos | Média |
+| Librosa pYIN | Análise de pitch | Média |
+| Síntese Granular | Reconstrução com grãos de áudio | Média |
+| Mixagem | Combinação final dos stems | Baixa |
+
+---
+
+## 2. Stack Tecnológica
+
+### 2.1 Escolhas e Justificativas
+
+| Componente | Tecnologia | Justificativa |
+|------------|------------|---------------|
+| **API** | FastAPI | Async nativo, compatível com ecossistema Python de áudio |
+| **Task Queue** | Celery + Redis | Processamento assíncrono de tarefas longas |
+| **Banco de Dados** | PostgreSQL | Metadados de projetos e arquivos |
+| **Cache** | Redis | Cache de análises e bibliotecas de grãos |
+| **Storage** | MinIO (S3-compatible) | Armazenamento de arquivos de áudio |
+| **Processamento** | librosa, numpy, soundfile | Mesmo do notebook original |
+| **Separação** | Demucs | Separação de stems state-of-art |
+
+### 2.2 Dependências Python
+
+```txt
+# requirements.txt
+fastapi==0.109.0
+uvicorn==0.27.0
+celery==5.3.4
+redis==5.0.1
+sqlalchemy==2.0.25
+asyncpg==0.29.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# Áudio
+librosa==0.10.1
+numpy==1.26.3
+soundfile==0.12.1
+demucs==4.0.1
+torch==2.1.2
+torchaudio==2.1.2
+
+# Storage
+minio==7.2.3
+python-multipart==0.0.6
+```
+
+---
+
+## 3. Arquitetura do Sistema
+
+### 3.1 Diagrama Geral
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                            FRONTEND                                      │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          FastAPI (API)                                   │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
+│  │ /upload  │  │/projects │  │ /library │  │   /mix   │  │   /ws    │  │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                ┌───────────────────┼───────────────────┐
+                ▼                   ▼                   ▼
+        ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+        │ PostgreSQL  │     │    Redis    │     │    MinIO    │
+        │ (metadados) │     │(cache/queue)│     │  (storage)  │
+        └─────────────┘     └─────────────┘     └─────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         CELERY WORKERS                                   │
+│  ┌─────────────────────┐          ┌─────────────────────────────────┐  │
+│  │    GPU Worker       │          │         CPU Workers             │  │
+│  │  (Separação Demucs) │          │  (Análise + Síntese + Mix)      │  │
+│  └─────────────────────┘          └─────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 Fluxo Principal
+
+```
+1. UPLOAD
+   Cliente ──POST /upload/base-track──▶ API ──▶ MinIO
+                                            └──▶ Celery Task (separação)
+
+2. SEPARAÇÃO (GPU Worker)
+   Download arquivo ──▶ Demucs ──▶ 4 stems ──▶ Upload MinIO
+                                           └──▶ Notifica via WebSocket
+
+3. ANÁLISE (CPU Worker)
+   Para cada stem: Detectar onsets + Extrair pitch ──▶ Cache Redis
+
+4. BIBLIOTECA DE GRÃOS (CPU Worker)
+   Arquivo estilo ──▶ Split por silêncio ──▶ Análise grãos ──▶ Cache Redis
+
+5. SÍNTESE + MIX (CPU Worker)
+   Para cada stem configurado:
+     - Carregar análise + grãos
+     - Síntese granular
+     - Somar stems + vocais
+     - Normalizar ──▶ Upload MinIO
+```
+
+---
+
+## 4. Estrutura de Pastas
+
+```
+audio-mixer-backend/
+├── docker/
+│   ├── api/
+│   │   └── Dockerfile
+│   ├── worker-cpu/
+│   │   └── Dockerfile
+│   └── worker-gpu/
+│       └── Dockerfile
+│
+├── src/
+│   ├── __init__.py
+│   ├── main.py                      # Entry point FastAPI
+│   │
+│   ├── config/
+│   │   ├── __init__.py
+│   │   └── settings.py              # Configurações (Pydantic Settings)
+│   │
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── deps.py                  # Dependências injetadas
+│   │   │
+│   │   └── v1/
+│   │       ├── __init__.py
+│   │       ├── router.py            # Router principal
+│   │       │
+│   │       ├── upload/
+│   │       │   ├── router.py        # POST /upload/base-track, /upload/style
+│   │       │   └── schemas.py
+│   │       │
+│   │       ├── projects/
+│   │       │   ├── router.py        # CRUD projetos
+│   │       │   └── schemas.py
+│   │       │
+│   │       ├── library/
+│   │       │   ├── router.py        # Biblioteca de sons
+│   │       │   └── schemas.py
+│   │       │
+│   │       ├── mix/
+│   │       │   ├── router.py        # POST /mix, GET /mix/{id}
+│   │       │   └── schemas.py
+│   │       │
+│   │       └── websocket/
+│   │           ├── router.py        # WebSocket para notificações
+│   │           └── manager.py       # Gerenciador de conexões
+│   │
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── audio_loader.py          # Carregar/salvar áudio
+│   │   ├── stem_separator.py        # Wrapper Demucs
+│   │   ├── onset_detector.py        # Detecção de onsets
+│   │   ├── pitch_analyzer.py        # Análise de pitch (pYIN)
+│   │   ├── grain_builder.py         # Construção biblioteca grãos
+│   │   ├── granular_synth.py        # Síntese granular
+│   │   └── mixer.py                 # Mixagem final
+│   │
+│   ├── db/
+│   │   ├── __init__.py
+│   │   ├── database.py              # Conexão PostgreSQL
+│   │   ├── models.py                # SQLAlchemy models
+│   │   └── repositories.py          # CRUD operations
+│   │
+│   ├── storage/
+│   │   ├── __init__.py
+│   │   └── minio_client.py          # Cliente MinIO
+│   │
+│   ├── cache/
+│   │   ├── __init__.py
+│   │   └── redis_client.py          # Cliente Redis + cache de grãos
+│   │
+│   └── tasks/
+│       ├── __init__.py
+│       ├── celery_app.py            # Configuração Celery
+│       ├── separation.py            # Task separação stems
+│       ├── analysis.py              # Task análise áudio
+│       └── synthesis.py             # Task síntese + mix
+│
+├── docker-compose.yml
+├── requirements.txt
+├── .env.example
+└── README.md
+```
+
+---
+
+## 5. Modelos de Dados
+
+### 5.1 PostgreSQL Models
+
+```python
+# src/db/models.py
+from sqlalchemy import Column, String, Integer, Float, Boolean, DateTime, ForeignKey, JSON
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+import uuid
+
+from src.db.database import Base
+
+class Project(Base):
+    __tablename__ = "projects"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(255), nullable=False)
+    status = Column(String(50), default="created")  # created, separating, ready, error
+    
+    # Arquivo base
+    base_file_path = Column(String(500))
+    base_file_hash = Column(String(64))
+    duration_seconds = Column(Float)
+    sample_rate = Column(Integer, default=44100)
+    
+    # Stems (preenchido após separação)
+    vocals_path = Column(String(500))
+    drums_path = Column(String(500))
+    bass_path = Column(String(500))
+    other_path = Column(String(500))
+    
+    # Análise cacheada
+    analysis_cache_key = Column(String(100))
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    
+    # Relacionamentos
+    mixes = relationship("Mix", back_populates="project")
+
+
+class StyleSound(Base):
+    __tablename__ = "style_sounds"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(255), nullable=False)
+    file_path = Column(String(500), nullable=False)
+    file_hash = Column(String(64))
+    
+    duration_seconds = Column(Float)
+    grain_count = Column(Integer)
+    grain_cache_key = Column(String(100))  # Chave no Redis
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Mix(Base):
+    __tablename__ = "mixes"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id"), nullable=False)
+    
+    status = Column(String(50), default="queued")  # queued, processing, complete, error
+    
+    # Configuração
+    config = Column(JSON)  # {drums: {style_id, volume}, bass: {...}, ...}
+    settings = Column(JSON)  # {grain_duration_ms, use_pitch_mapping, ...}
+    
+    # Resultado
+    output_path = Column(String(500))
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    completed_at = Column(DateTime(timezone=True))
+    
+    # Relacionamentos
+    project = relationship("Project", back_populates="mixes")
+```
+
+### 5.2 Estruturas de Cache (Redis)
+
+```python
+# Chaves Redis
+
+# Análise de stems (por projeto)
+"analysis:{project_id}" -> JSON {
+    "drums": {"onsets": [...], "pitches": [...]},
+    "bass": {"onsets": [...], "pitches": [...]},
+    "other": {"onsets": [...], "pitches": [...]}
+}
+
+# Biblioteca de grãos (por arquivo de estilo)
+"grains:{style_sound_id}" -> Pickle [
+    {"audio": np.array, "pitch": float, "rms": float},
+    ...
+]
+
+# Status de tarefas
+"task:{task_id}" -> JSON {"status": "...", "progress": 0.5}
+```
+
+---
+
+## 6. Configurações
+
+```python
+# src/config/settings.py
+from pydantic_settings import BaseSettings
+from functools import lru_cache
+
+class Settings(BaseSettings):
+    # API
+    APP_NAME: str = "Audio Mixer API"
+    DEBUG: bool = False
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
+    
+    # Database
+    DATABASE_URL: str = "postgresql+asyncpg://user:pass@localhost:5432/audiomixer"
+    
+    # Redis
+    REDIS_URL: str = "redis://localhost:6379/0"
+    
+    # MinIO
+    MINIO_ENDPOINT: str = "localhost:9000"
+    MINIO_ACCESS_KEY: str = "minioadmin"
+    MINIO_SECRET_KEY: str = "minioadmin"
+    MINIO_BUCKET: str = "audio-storage"
+    MINIO_SECURE: bool = False
+    
+    # Celery
+    CELERY_BROKER_URL: str = "redis://localhost:6379/1"
+    CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"
+    
+    # Audio Processing
+    DEFAULT_SAMPLE_RATE: int = 44100
+    MAX_UPLOAD_SIZE_MB: int = 100
+    GRAIN_DURATION_MS: int = 120
+    USE_PITCH_MAPPING: bool = True
+    USE_ENVELOPE: bool = True
+    
+    # Demucs
+    DEMUCS_MODEL: str = "htdemucs_ft"
+    
+    class Config:
+        env_file = ".env"
+
+@lru_cache()
+def get_settings() -> Settings:
+    return Settings()
+```
+
+---
+
+## 7. Serviços de Processamento de Áudio
+
+### 7.1 Wrapper Demucs
+
+```python
+# src/services/stem_separator.py
+import subprocess
+import os
+from pathlib import Path
+from src.config.settings import get_settings
+
+settings = get_settings()
+
+class StemSeparator:
+    """Wrapper para separação de stems usando Demucs."""
+    
+    def __init__(self, model: str = None):
+        self.model = model or settings.DEMUCS_MODEL
+        
+    def separate(self, input_path: str, output_dir: str) -> dict[str, str]:
+        """
+        Separa arquivo de áudio em 4 stems.
+        
+        Returns:
+            Dict com paths dos stems: {vocals, drums, bass, other}
+        """
+        # Executar Demucs
+        cmd = [
+            "python", "-m", "demucs",
+            "-n", self.model,
+            "-o", output_dir,
+            input_path
+        ]
+        
+        subprocess.run(cmd, check=True, capture_output=True)
+        
+        # Construir paths de saída
+        input_name = Path(input_path).stem
+        stems_dir = Path(output_dir) / self.model / input_name
+        
+        return {
+            "vocals": str(stems_dir / "vocals.wav"),
+            "drums": str(stems_dir / "drums.wav"),
+            "bass": str(stems_dir / "bass.wav"),
+            "other": str(stems_dir / "other.wav"),
+        }
+```
+
+### 7.2 Detector de Onsets
+
+```python
+# src/services/onset_detector.py
+import numpy as np
+import librosa
+
+class OnsetDetector:
+    """Detecção de eventos rítmicos usando librosa."""
+    
+    def __init__(self, sample_rate: int = 44100):
+        self.sample_rate = sample_rate
+        
+    def detect(self, audio: np.ndarray, delta: float = 0.06) -> dict:
+        """
+        Detecta onsets no áudio.
+        
+        Returns:
+            Dict com frames e samples dos onsets
+        """
+        onset_frames = librosa.onset.onset_detect(
+            y=audio,
+            sr=self.sample_rate,
+            units='frames',
+            wait=1,
+            pre_avg=1,
+            post_avg=1,
+            post_max=1,
+            delta=delta
+        )
+        
+        onset_samples = librosa.frames_to_samples(onset_frames)
+        
+        return {
+            "frames": onset_frames.tolist(),
+            "samples": onset_samples.tolist(),
+            "count": len(onset_frames)
+        }
+```
+
+### 7.3 Analisador de Pitch
+
+```python
+# src/services/pitch_analyzer.py
+import numpy as np
+import librosa
+
+class PitchAnalyzer:
+    """Análise de pitch usando pYIN."""
+    
+    def __init__(self, sample_rate: int = 44100):
+        self.sample_rate = sample_rate
+        self.fmin = librosa.note_to_hz('C1')
+        self.fmax = librosa.note_to_hz('C7')
+        
+    def analyze_segment(self, audio: np.ndarray) -> float:
+        """Analisa pitch de um segmento de áudio."""
+        if len(audio) < 1024:
+            return 0.0
+            
+        try:
+            f0, voiced_flag, voiced_probs = librosa.pyin(
+                audio,
+                fmin=self.fmin,
+                fmax=self.fmax,
+                sr=self.sample_rate,
+                frame_length=min(len(audio), 2048),
+                fill_na=0
+            )
+            
+            non_zero = f0[f0 > 0]
+            if len(non_zero) > 0:
+                return float(np.mean(non_zero))
+        except Exception:
+            pass
+            
+        return 0.0
+    
+    def analyze_at_onsets(
+        self, 
+        audio: np.ndarray, 
+        onset_samples: list[int],
+        window_ms: int = 120
+    ) -> list[dict]:
+        """Analisa pitch em cada posição de onset."""
+        window_samples = int(self.sample_rate * (window_ms / 1000))
+        results = []
+        
+        for onset in onset_samples:
+            end = min(onset + window_samples, len(audio))
+            segment = audio[onset:end]
+            
+            if len(segment) == 0:
+                continue
+                
+            pitch = self.analyze_segment(segment)
+            peak = float(np.max(np.abs(segment)))
+            
+            results.append({
+                "start": onset,
+                "pitch": pitch,
+                "peak": peak
+            })
+            
+        return results
+```
+
+### 7.4 Construtor de Biblioteca de Grãos
+
+```python
+# src/services/grain_builder.py
+import numpy as np
+import librosa
+from dataclasses import dataclass
+from typing import List
+
+@dataclass
+class Grain:
+    audio: np.ndarray
+    pitch: float
+    rms: float
+
+class GrainBuilder:
+    """Constrói biblioteca de grãos a partir de arquivo de estilo."""
+    
+    def __init__(self, sample_rate: int = 44100):
+        self.sample_rate = sample_rate
+        self.pitch_analyzer = PitchAnalyzer(sample_rate)
+        
+    def build_library(self, audio: np.ndarray, top_db: int = 20) -> List[Grain]:
+        """
+        Fatia áudio por silêncio e analisa cada grão.
+        """
+        # Detectar regiões não-silenciosas
+        intervals = librosa.effects.split(audio, top_db=top_db)
+        
+        grains = []
+        for start, end in intervals:
+            grain_audio = audio[start:end]
+            
+            if len(grain_audio) < 512:  # Ignorar grãos muito curtos
+                continue
+            
+            # Análise de pitch
+            pitch = self.pitch_analyzer.analyze_segment(grain_audio)
+            
+            # RMS para intensidade
+            rms = float(np.sqrt(np.mean(grain_audio ** 2)))
+            
+            grains.append(Grain(
+                audio=grain_audio,
+                pitch=pitch,
+                rms=rms
+            ))
+            
+        return grains
+```
+
+### 7.5 Sintetizador Granular
+
+```python
+# src/services/granular_synth.py
+import numpy as np
+import random
+from typing import List, Optional
+from src.services.grain_builder import Grain
+from src.services.onset_detector import OnsetDetector
+from src.services.pitch_analyzer import PitchAnalyzer
+
+class GranularSynthesizer:
+    """
+    Síntese granular - extração da função processar_faixa() do notebook.
+    """
+    
+    def __init__(
+        self,
+        sample_rate: int = 44100,
+        grain_duration_ms: int = 120,
+        use_pitch_mapping: bool = True,
+        use_envelope: bool = True
+    ):
+        self.sample_rate = sample_rate
+        self.grain_duration_ms = grain_duration_ms
+        self.use_pitch_mapping = use_pitch_mapping
+        self.use_envelope = use_envelope
+        
+        self.decay_samples = int(sample_rate * (grain_duration_ms / 1000))
+        self.envelope = np.linspace(1.0, 0.0, num=self.decay_samples)
+        
+        self.onset_detector = OnsetDetector(sample_rate)
+        self.pitch_analyzer = PitchAnalyzer(sample_rate)
+    
+    def synthesize(
+        self,
+        base_stem: np.ndarray,
+        grain_library: List[Grain],
+        instrument_type: str = "melodic"  # "melodic" ou "drums"
+    ) -> np.ndarray:
+        """
+        Sintetiza faixa usando grãos.
+        """
+        if not grain_library:
+            return np.zeros(len(base_stem))
+        
+        # Detectar onsets no stem base
+        onset_data = self.onset_detector.detect(base_stem)
+        onset_samples = onset_data["samples"]
+        
+        # Buffer de saída
+        output = np.zeros(len(base_stem))
+        
+        for onset in onset_samples:
+            # Extrair segmento para análise
+            end = min(onset + self.decay_samples, len(base_stem))
+            segment = base_stem[onset:end]
+            
+            if len(segment) == 0:
+                continue
+            
+            peak_vol = float(np.max(np.abs(segment)))
+            
+            # Determinar pitch alvo
+            target_pitch = 0.0
+            if self.use_pitch_mapping and instrument_type != "drums":
+                target_pitch = self.pitch_analyzer.analyze_segment(segment)
+            
+            # Selecionar grão
+            grain = self._select_grain(grain_library, target_pitch)
+            if grain is None:
+                continue
+            
+            # Processar e inserir grão
+            processed = self._process_grain(grain.audio, peak_vol)
+            
+            # Mixagem aditiva
+            end_pos = min(onset + len(processed), len(output))
+            actual_len = end_pos - onset
+            output[onset:end_pos] += processed[:actual_len]
+        
+        return output
+    
+    def _select_grain(
+        self, 
+        library: List[Grain], 
+        target_pitch: float
+    ) -> Optional[Grain]:
+        """Seleciona grão mais adequado."""
+        if target_pitch == 0:
+            return random.choice(library)
+        
+        # Encontrar grão com pitch mais próximo
+        return min(library, key=lambda g: abs(g.pitch - target_pitch))
+    
+    def _process_grain(self, grain_audio: np.ndarray, amplitude: float) -> np.ndarray:
+        """Processa grão aplicando envelope e amplitude."""
+        # Ajustar tamanho
+        if len(grain_audio) < self.decay_samples:
+            repeats = int(np.ceil(self.decay_samples / len(grain_audio)))
+            grain_ready = np.tile(grain_audio, repeats)[:self.decay_samples]
+        else:
+            grain_ready = grain_audio[:self.decay_samples]
+        
+        # Aplicar envelope e amplitude
+        if self.use_envelope:
+            return (grain_ready * self.envelope) * amplitude
+        
+        return grain_ready * amplitude
+```
+
+### 7.6 Mixer
+
+```python
+# src/services/mixer.py
+import numpy as np
+import soundfile as sf
+
+class AudioMixer:
+    """Mixagem final de stems."""
+    
+    @staticmethod
+    def mix(
+        stems: dict[str, np.ndarray],
+        volumes: dict[str, float] = None
+    ) -> np.ndarray:
+        """
+        Combina múltiplos stems em um único áudio.
+        """
+        volumes = volumes or {}
+        
+        # Encontrar tamanho máximo
+        max_len = max(len(s) for s in stems.values())
+        
+        # Mixar
+        output = np.zeros(max_len)
+        for name, audio in stems.items():
+            vol = volumes.get(name, 1.0)
+            padded = np.pad(audio, (0, max_len - len(audio)))
+            output += padded * vol
+        
+        return output
+    
+    @staticmethod
+    def normalize(audio: np.ndarray) -> np.ndarray:
+        """Normaliza áudio para evitar clipping."""
+        max_val = np.max(np.abs(audio))
+        if max_val > 0:
+            return audio / max_val
+        return audio
+    
+    @staticmethod
+    def export(audio: np.ndarray, path: str, sample_rate: int = 44100):
+        """Exporta áudio para arquivo."""
+        sf.write(path, audio, sample_rate)
+```
+
+---
+
+## 8. Tasks Celery
+
+### 8.1 Configuração
+
+```python
+# src/tasks/celery_app.py
+from celery import Celery
+from src.config.settings import get_settings
+
+settings = get_settings()
+
+celery_app = Celery(
+    "audio_mixer",
+    broker=settings.CELERY_BROKER_URL,
+    backend=settings.CELERY_RESULT_BACKEND,
+    include=[
+        "src.tasks.separation",
+        "src.tasks.analysis",
+        "src.tasks.synthesis",
+    ]
+)
+
+celery_app.conf.update(
+    task_serializer='pickle',
+    accept_content=['pickle', 'json'],
+    result_serializer='pickle',
+    task_track_started=True,
+    task_time_limit=900,  # 15 min max
+)
+```
+
+### 8.2 Task de Separação
+
+```python
+# src/tasks/separation.py
+from celery import shared_task
+from src.tasks.celery_app import celery_app
+from src.services.stem_separator import StemSeparator
+from src.storage.minio_client import MinIOClient
+from src.db.repositories import ProjectRepository
+import tempfile
+import os
+
+@celery_app.task(bind=True, name="tasks.separate_stems")
+def separate_stems(self, project_id: str):
+    """Task para separar stems de uma música."""
+    
+    storage = MinIOClient()
+    repo = ProjectRepository()
+    separator = StemSeparator()
+    
+    # Atualizar status
+    repo.update_status(project_id, "separating")
+    
+    try:
+        # Buscar projeto
+        project = repo.get_by_id(project_id)
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Download do arquivo base
+            local_input = os.path.join(tmpdir, "input.wav")
+            storage.download(project.base_file_path, local_input)
+            
+            # Separar stems
+            stems = separator.separate(local_input, tmpdir)
+            
+            # Upload dos stems
+            stem_paths = {}
+            for stem_name, local_path in stems.items():
+                remote_path = f"stems/{project_id}/{stem_name}.wav"
+                storage.upload(local_path, remote_path)
+                stem_paths[stem_name] = remote_path
+            
+            # Atualizar projeto
+            repo.update_stems(project_id, stem_paths)
+            repo.update_status(project_id, "ready")
+            
+        return {"status": "success", "project_id": project_id}
+        
+    except Exception as e:
+        repo.update_status(project_id, "error")
+        raise e
+```
+
+### 8.3 Task de Análise
+
+```python
+# src/tasks/analysis.py
+from celery import shared_task
+from src.tasks.celery_app import celery_app
+from src.services.onset_detector import OnsetDetector
+from src.services.pitch_analyzer import PitchAnalyzer
+from src.storage.minio_client import MinIOClient
+from src.cache.redis_client import RedisCache
+from src.db.repositories import ProjectRepository
+import librosa
+import tempfile
+
+@celery_app.task(name="tasks.analyze_stems")
+def analyze_stems(project_id: str):
+    """Analisa onsets e pitch de cada stem."""
+    
+    storage = MinIOClient()
+    cache = RedisCache()
+    repo = ProjectRepository()
+    
+    project = repo.get_by_id(project_id)
+    
+    onset_detector = OnsetDetector()
+    pitch_analyzer = PitchAnalyzer()
+    
+    analysis_results = {}
+    
+    for stem_name in ["drums", "bass", "other"]:
+        stem_path = getattr(project, f"{stem_name}_path")
+        if not stem_path:
+            continue
+        
+        with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
+            storage.download(stem_path, tmp.name)
+            audio, sr = librosa.load(tmp.name, sr=44100)
+        
+        # Detectar onsets
+        onsets = onset_detector.detect(audio)
+        
+        # Analisar pitch em cada onset
+        pitch_data = pitch_analyzer.analyze_at_onsets(
+            audio, 
+            onsets["samples"]
+        )
+        
+        analysis_results[stem_name] = {
+            "onsets": onsets,
+            "pitch_data": pitch_data
+        }
+    
+    # Cachear resultado
+    cache_key = f"analysis:{project_id}"
+    cache.set_json(cache_key, analysis_results)
+    
+    repo.update(project_id, {"analysis_cache_key": cache_key})
+    
+    return {"status": "success", "cache_key": cache_key}
+```
+
+### 8.4 Task de Síntese e Mixagem
+
+```python
+# src/tasks/synthesis.py
+from celery import shared_task
+from src.tasks.celery_app import celery_app
+from src.services.granular_synth import GranularSynthesizer
+from src.services.mixer import AudioMixer
+from src.storage.minio_client import MinIOClient
+from src.cache.redis_client import RedisCache
+from src.db.repositories import ProjectRepository, MixRepository, StyleSoundRepository
+import librosa
+import tempfile
+import os
+
+@celery_app.task(name="tasks.create_mix")
+def create_mix(mix_id: str):
+    """Cria mixagem completa."""
+    
+    storage = MinIOClient()
+    cache = RedisCache()
+    mix_repo = MixRepository()
+    project_repo = ProjectRepository()
+    style_repo = StyleSoundRepository()
+    
+    synth = GranularSynthesizer()
+    mixer = AudioMixer()
+    
+    # Buscar dados
+    mix = mix_repo.get_by_id(mix_id)
+    project = project_repo.get_by_id(mix.project_id)
+    config = mix.config
+    
+    mix_repo.update_status(mix_id, "processing")
+    
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stems_output = {}
+            
+            # Carregar vocais (não processados)
+            if config.get("vocals", {}).get("enabled", True):
+                vocals_local = os.path.join(tmpdir, "vocals.wav")
+                storage.download(project.vocals_path, vocals_local)
+                vocals, _ = librosa.load(vocals_local, sr=44100)
+                stems_output["vocals"] = vocals * config["vocals"].get("volume", 1.0)
+            
+            # Processar cada stem com síntese granular
+            for stem_name in ["drums", "bass", "other"]:
+                stem_config = config.get(stem_name, {})
+                
+                if not stem_config.get("enabled", False):
+                    continue
+                
+                style_id = stem_config.get("style_sound_id")
+                if not style_id:
+                    continue
+                
+                # Carregar stem base
+                stem_path = getattr(project, f"{stem_name}_path")
+                stem_local = os.path.join(tmpdir, f"{stem_name}.wav")
+                storage.download(stem_path, stem_local)
+                stem_audio, _ = librosa.load(stem_local, sr=44100)
+                
+                # Carregar biblioteca de grãos do cache
+                style = style_repo.get_by_id(style_id)
+                grain_library = cache.get_grains(style.grain_cache_key)
+                
+                if not grain_library:
+                    # Reconstruir se não estiver em cache
+                    grain_library = build_grain_library(style_id)
+                
+                # Sintetizar
+                instrument_type = "drums" if stem_name == "drums" else "melodic"
+                synthesized = synth.synthesize(
+                    stem_audio,
+                    grain_library,
+                    instrument_type=instrument_type
+                )
+                
+                volume = stem_config.get("volume", 1.0)
+                stems_output[stem_name] = synthesized * volume
+            
+            # Mixar tudo
+            final_mix = mixer.mix(stems_output)
+            final_mix = mixer.normalize(final_mix)
+            
+            # Exportar
+            output_local = os.path.join(tmpdir, "mix_output.wav")
+            mixer.export(final_mix, output_local)
+            
+            # Upload
+            output_path = f"mixes/{mix_id}/output.wav"
+            storage.upload(output_local, output_path)
+            
+            # Atualizar
+            mix_repo.update(mix_id, {
+                "status": "complete",
+                "output_path": output_path
+            })
+            
+        return {"status": "success", "mix_id": mix_id, "output_path": output_path}
+        
+    except Exception as e:
+        mix_repo.update_status(mix_id, "error")
+        raise e
+```
+
+---
+
+## 9. Endpoints da API
+
+### 9.1 Upload
+
+```python
+# src/api/v1/upload/router.py
+from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
+from src.storage.minio_client import MinIOClient
+from src.db.repositories import ProjectRepository, StyleSoundRepository
+from src.tasks.separation import separate_stems
+from src.tasks.analysis import build_grain_library
+import hashlib
+import uuid
+
+router = APIRouter(prefix="/upload", tags=["upload"])
+
+@router.post("/base-track")
+async def upload_base_track(
+    file: UploadFile = File(...),
+    project_name: str = None
+):
+    """Upload de música base para separação."""
+    
+    # Validar formato
+    if not file.filename.lower().endswith(('.wav', '.mp3', '.flac', '.ogg')):
+        raise HTTPException(400, "Formato não suportado")
+    
+    content = await file.read()
+    
+    # Verificar tamanho (100MB max)
+    if len(content) > 100 * 1024 * 1024:
+        raise HTTPException(413, "Arquivo muito grande (max 100MB)")
+    
+    # Hash para deduplicação
+    file_hash = hashlib.sha256(content).hexdigest()
+    
+    # Gerar IDs
+    project_id = str(uuid.uuid4())
+    storage_path = f"uploads/base/{project_id}/{file.filename}"
+    
+    # Upload para MinIO
+    storage = MinIOClient()
+    storage.upload_bytes(content, storage_path)
+    
+    # Criar projeto no banco
+    repo = ProjectRepository()
+    project = repo.create({
+        "id": project_id,
+        "name": project_name or file.filename,
+        "base_file_path": storage_path,
+        "base_file_hash": file_hash,
+        "status": "created"
+    })
+    
+    # Disparar task de separação
+    separate_stems.delay(project_id)
+    
+    return {
+        "project_id": project_id,
+        "status": "queued",
+        "message": "Separação de stems iniciada"
+    }
+
+
+@router.post("/style-sound")
+async def upload_style_sound(
+    files: list[UploadFile] = File(...)
+):
+    """Upload de sons de estilo para biblioteca."""
+    
+    storage = MinIOClient()
+    repo = StyleSoundRepository()
+    
+    uploaded = []
+    
+    for file in files:
+        content = await file.read()
+        file_hash = hashlib.sha256(content).hexdigest()
+        
+        # Verificar duplicata
+        existing = repo.get_by_hash(file_hash)
+        if existing:
+            uploaded.append({"id": str(existing.id), "name": existing.name, "duplicate": True})
+            continue
+        
+        style_id = str(uuid.uuid4())
+        storage_path = f"uploads/styles/{style_id}/{file.filename}"
+        
+        storage.upload_bytes(content, storage_path)
+        
+        style = repo.create({
+            "id": style_id,
+            "name": file.filename,
+            "file_path": storage_path,
+            "file_hash": file_hash
+        })
+        
+        # Disparar construção de biblioteca de grãos
+        build_grain_library.delay(style_id)
+        
+        uploaded.append({"id": style_id, "name": file.filename, "duplicate": False})
+    
+    return {"uploaded": uploaded}
+```
+
+### 9.2 Projects
+
+```python
+# src/api/v1/projects/router.py
+from fastapi import APIRouter, HTTPException
+from src.db.repositories import ProjectRepository
+
+router = APIRouter(prefix="/projects", tags=["projects"])
+
+@router.get("")
+async def list_projects():
+    """Lista todos os projetos."""
+    repo = ProjectRepository()
+    projects = repo.get_all()
+    return {"projects": [p.to_dict() for p in projects]}
+
+
+@router.get("/{project_id}")
+async def get_project(project_id: str):
+    """Detalhes de um projeto."""
+    repo = ProjectRepository()
+    project = repo.get_by_id(project_id)
+    
+    if not project:
+        raise HTTPException(404, "Projeto não encontrado")
+    
+    return project.to_dict()
+
+
+@router.get("/{project_id}/status")
+async def get_project_status(project_id: str):
+    """Status de processamento do projeto."""
+    repo = ProjectRepository()
+    project = repo.get_by_id(project_id)
+    
+    if not project:
+        raise HTTPException(404, "Projeto não encontrado")
+    
+    response = {
+        "project_id": project_id,
+        "status": project.status
+    }
+    
+    if project.status == "ready":
+        response["stems"] = {
+            "vocals": project.vocals_path is not None,
+            "drums": project.drums_path is not None,
+            "bass": project.bass_path is not None,
+            "other": project.other_path is not None,
+        }
+    
+    return response
+
+
+@router.delete("/{project_id}")
+async def delete_project(project_id: str):
+    """Remove projeto e arquivos associados."""
+    repo = ProjectRepository()
+    storage = MinIOClient()
+    
+    project = repo.get_by_id(project_id)
+    if not project:
+        raise HTTPException(404, "Projeto não encontrado")
+    
+    # Remover arquivos
+    storage.delete_prefix(f"uploads/base/{project_id}/")
+    storage.delete_prefix(f"stems/{project_id}/")
+    storage.delete_prefix(f"mixes/{project_id}/")
+    
+    # Remover do banco
+    repo.delete(project_id)
+    
+    return {"message": "Projeto removido"}
+```
+
+### 9.3 Library
+
+```python
+# src/api/v1/library/router.py
+from fastapi import APIRouter, HTTPException
+from src.db.repositories import StyleSoundRepository
+
+router = APIRouter(prefix="/library", tags=["library"])
+
+@router.get("")
+async def list_sounds():
+    """Lista biblioteca de sons de estilo."""
+    repo = StyleSoundRepository()
+    sounds = repo.get_all()
+    return {"sounds": [s.to_dict() for s in sounds]}
+
+
+@router.get("/{sound_id}")
+async def get_sound(sound_id: str):
+    """Detalhes de um som de estilo."""
+    repo = StyleSoundRepository()
+    sound = repo.get_by_id(sound_id)
+    
+    if not sound:
+        raise HTTPException(404, "Som não encontrado")
+    
+    return sound.to_dict()
+
+
+@router.delete("/{sound_id}")
+async def delete_sound(sound_id: str):
+    """Remove som da biblioteca."""
+    repo = StyleSoundRepository()
+    storage = MinIOClient()
+    cache = RedisCache()
+    
+    sound = repo.get_by_id(sound_id)
+    if not sound:
+        raise HTTPException(404, "Som não encontrado")
+    
+    # Remover arquivo
+    storage.delete(sound.file_path)
+    
+    # Remover cache de grãos
+    if sound.grain_cache_key:
+        cache.delete(sound.grain_cache_key)
+    
+    # Remover do banco
+    repo.delete(sound_id)
+    
+    return {"message": "Som removido"}
+```
+
+### 9.4 Mix
+
+```python
+# src/api/v1/mix/router.py
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import Optional
+from src.db.repositories import MixRepository, ProjectRepository
+from src.tasks.synthesis import create_mix
+from src.storage.minio_client import MinIOClient
+import uuid
+
+router = APIRouter(prefix="/mix", tags=["mix"])
+
+class StemConfig(BaseModel):
+    style_sound_id: Optional[str] = None
+    volume: float = 1.0
+    enabled: bool = True
+
+class VocalsConfig(BaseModel):
+    volume: float = 1.0
+    enabled: bool = True
+
+class MixConfig(BaseModel):
+    drums: StemConfig = StemConfig()
+    bass: StemConfig = StemConfig()
+    other: StemConfig = StemConfig()
+    vocals: VocalsConfig = VocalsConfig()
+
+class MixSettings(BaseModel):
+    grain_duration_ms: int = 120
+    use_pitch_mapping: bool = True
+    use_envelope: bool = True
+
+class CreateMixRequest(BaseModel):
+    project_id: str
+    config: MixConfig
+    settings: MixSettings = MixSettings()
+
+
+@router.post("")
+async def create_mix_endpoint(request: CreateMixRequest):
+    """Cria nova mixagem."""
+    
+    project_repo = ProjectRepository()
+    mix_repo = MixRepository()
+    
+    # Verificar projeto
+    project = project_repo.get_by_id(request.project_id)
+    if not project:
+        raise HTTPException(404, "Projeto não encontrado")
+    
+    if project.status != "ready":
+        raise HTTPException(400, f"Projeto não está pronto (status: {project.status})")
+    
+    # Criar mix
+    mix_id = str(uuid.uuid4())
+    mix = mix_repo.create({
+        "id": mix_id,
+        "project_id": request.project_id,
+        "config": request.config.dict(),
+        "settings": request.settings.dict(),
+        "status": "queued"
+    })
+    
+    # Disparar task
+    create_mix.delay(mix_id)
+    
+    return {
+        "mix_id": mix_id,
+        "status": "queued",
+        "message": "Mixagem iniciada"
+    }
+
+
+@router.get("/{mix_id}")
+async def get_mix_status(mix_id: str):
+    """Status de uma mixagem."""
+    
+    repo = MixRepository()
+    mix = repo.get_by_id(mix_id)
+    
+    if not mix:
+        raise HTTPException(404, "Mixagem não encontrada")
+    
+    response = {
+        "mix_id": mix_id,
+        "status": mix.status,
+        "config": mix.config,
+        "created_at": mix.created_at.isoformat()
+    }
+    
+    if mix.status == "complete" and mix.output_path:
+        storage = MinIOClient()
+        response["download_url"] = storage.get_presigned_url(mix.output_path)
+    
+    return response
+
+
+@router.get("/{mix_id}/download")
+async def download_mix(mix_id: str):
+    """Redireciona para URL de download."""
+    from fastapi.responses import RedirectResponse
+    
+    repo = MixRepository()
+    mix = repo.get_by_id(mix_id)
+    
+    if not mix:
+        raise HTTPException(404, "Mixagem não encontrada")
+    
+    if mix.status != "complete":
+        raise HTTPException(400, "Mixagem ainda não concluída")
+    
+    storage = MinIOClient()
+    url = storage.get_presigned_url(mix.output_path, expires=3600)
+    
+    return RedirectResponse(url=url)
+```
+
+### 9.5 WebSocket para Notificações
+
+```python
+# src/api/v1/websocket/router.py
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from src.api.v1.websocket.manager import ConnectionManager
+
+router = APIRouter()
+manager = ConnectionManager()
+
+@router.websocket("/ws/project/{project_id}")
+async def project_websocket(websocket: WebSocket, project_id: str):
+    """WebSocket para acompanhar status do projeto."""
+    await manager.connect(websocket, f"project:{project_id}")
+    
+    try:
+        while True:
+            # Manter conexão aberta
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, f"project:{project_id}")
+
+
+@router.websocket("/ws/mix/{mix_id}")
+async def mix_websocket(websocket: WebSocket, mix_id: str):
+    """WebSocket para acompanhar status da mixagem."""
+    await manager.connect(websocket, f"mix:{mix_id}")
+    
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, f"mix:{mix_id}")
+```
+
+```python
+# src/api/v1/websocket/manager.py
+from fastapi import WebSocket
+from typing import Dict, Set
+import asyncio
+
+class ConnectionManager:
+    """Gerenciador de conexões WebSocket."""
+    
+    def __init__(self):
+        self.connections: Dict[str, Set[WebSocket]] = {}
+    
+    async def connect(self, websocket: WebSocket, channel: str):
+        await websocket.accept()
+        if channel not in self.connections:
+            self.connections[channel] = set()
+        self.connections[channel].add(websocket)
+    
+    def disconnect(self, websocket: WebSocket, channel: str):
+        if channel in self.connections:
+            self.connections[channel].discard(websocket)
+    
+    async def broadcast(self, channel: str, message: dict):
+        """Envia mensagem para todos os clientes de um canal."""
+        if channel not in self.connections:
+            return
+        
+        for websocket in self.connections[channel].copy():
+            try:
+                await websocket.send_json(message)
+            except Exception:
+                self.connections[channel].discard(websocket)
+
+
+# Instância global
+ws_manager = ConnectionManager()
+```
+
+---
+
+## 10. Storage e Cache
+
+### 10.1 Cliente MinIO
+
+```python
+# src/storage/minio_client.py
+from minio import Minio
+from minio.error import S3Error
+from src.config.settings import get_settings
+from io import BytesIO
+from datetime import timedelta
+
+settings = get_settings()
+
+class MinIOClient:
+    """Cliente para operações no MinIO/S3."""
+    
+    def __init__(self):
+        self.client = Minio(
+            settings.MINIO_ENDPOINT,
+            access_key=settings.MINIO_ACCESS_KEY,
+            secret_key=settings.MINIO_SECRET_KEY,
+            secure=settings.MINIO_SECURE
+        )
+        self.bucket = settings.MINIO_BUCKET
+        self._ensure_bucket()
+    
+    def _ensure_bucket(self):
+        """Cria bucket se não existir."""
+        if not self.client.bucket_exists(self.bucket):
+            self.client.make_bucket(self.bucket)
+    
+    def upload(self, local_path: str, remote_path: str):
+        """Upload de arquivo local."""
+        self.client.fput_object(self.bucket, remote_path, local_path)
+    
+    def upload_bytes(self, data: bytes, remote_path: str):
+        """Upload de bytes."""
+        self.client.put_object(
+            self.bucket,
+            remote_path,
+            BytesIO(data),
+            length=len(data)
+        )
+    
+    def download(self, remote_path: str, local_path: str):
+        """Download para arquivo local."""
+        self.client.fget_object(self.bucket, remote_path, local_path)
+    
+    def get_presigned_url(self, remote_path: str, expires: int = 3600) -> str:
+        """Gera URL temporária para download."""
+        return self.client.presigned_get_object(
+            self.bucket,
+            remote_path,
+            expires=timedelta(seconds=expires)
+        )
+    
+    def delete(self, remote_path: str):
+        """Remove arquivo."""
+        self.client.remove_object(self.bucket, remote_path)
+    
+    def delete_prefix(self, prefix: str):
+        """Remove todos os arquivos com determinado prefixo."""
+        objects = self.client.list_objects(self.bucket, prefix=prefix, recursive=True)
+        for obj in objects:
+            self.client.remove_object(self.bucket, obj.object_name)
+```
+
+### 10.2 Cliente Redis
+
+```python
+# src/cache/redis_client.py
+import redis
+import pickle
+import json
+from src.config.settings import get_settings
+
+settings = get_settings()
+
+class RedisCache:
+    """Cliente Redis para cache."""
+    
+    def __init__(self):
+        self.client = redis.from_url(settings.REDIS_URL)
+    
+    def set_json(self, key: str, value: dict, ttl: int = 86400):
+        """Armazena JSON."""
+        self.client.setex(key, ttl, json.dumps(value))
+    
+    def get_json(self, key: str) -> dict | None:
+        """Recupera JSON."""
+        data = self.client.get(key)
+        if data:
+            return json.loads(data)
+        return None
+    
+    def set_grains(self, key: str, grains: list, ttl: int = 86400):
+        """Armazena biblioteca de grãos (pickle)."""
+        self.client.setex(key, ttl, pickle.dumps(grains))
+    
+    def get_grains(self, key: str) -> list | None:
+        """Recupera biblioteca de grãos."""
+        data = self.client.get(key)
+        if data:
+            return pickle.loads(data)
+        return None
+    
+    def delete(self, key: str):
+        """Remove chave."""
+        self.client.delete(key)
+    
+    def publish(self, channel: str, message: dict):
+        """Publica mensagem em canal."""
+        self.client.publish(channel, json.dumps(message))
+```
+
+---
+
+## 11. Docker Compose
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/audiomixer
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+    depends_on:
+      - db
+      - redis
+      - minio
+    volumes:
+      - ./src:/app/src
+
+  worker-cpu:
+    build:
+      context: .
+      dockerfile: docker/worker-cpu/Dockerfile
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/audiomixer
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+    command: celery -A src.tasks.celery_app worker --loglevel=info --concurrency=4
+    depends_on:
+      - db
+      - redis
+      - minio
+    volumes:
+      - ./src:/app/src
+
+  worker-gpu:
+    build:
+      context: .
+      dockerfile: docker/worker-gpu/Dockerfile
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/audiomixer
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+    command: celery -A src.tasks.celery_app worker --loglevel=info --concurrency=1 -Q gpu
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      - db
+      - redis
+      - minio
+    volumes:
+      - ./src:/app/src
+
+  db:
+    image: postgres:15
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=audiomixer
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+```
+
+---
+
+## 12. Dockerfiles
+
+### 12.1 API
+
+```dockerfile
+# docker/api/Dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsndfile1 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/ ./src/
+
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8000
+
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+### 12.2 Worker CPU
+
+```dockerfile
+# docker/worker-cpu/Dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsndfile1 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/ ./src/
+
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+CMD ["celery", "-A", "src.tasks.celery_app", "worker", "--loglevel=info"]
+```
+
+### 12.3 Worker GPU
+
+```dockerfile
+# docker/worker-gpu/Dockerfile
+FROM nvidia/cuda:12.1-runtime-ubuntu22.04
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3-pip \
+    libsndfile1 \
+    ffmpeg \
+    git \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/python3.11 /usr/bin/python
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir demucs
+
+# Pré-download do modelo
+RUN python -c "import demucs.pretrained; demucs.pretrained.get_model('htdemucs_ft')"
+
+COPY src/ ./src/
+
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+CMD ["celery", "-A", "src.tasks.celery_app", "worker", "--loglevel=info", "-Q", "gpu", "--concurrency=1"]
+```
+
+---
+
+## 13. Entry Point FastAPI
+
+```python
+# src/main.py
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from src.api.v1.router import api_router
+from src.api.v1.websocket.router import router as ws_router
+from src.config.settings import get_settings
+
+settings = get_settings()
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version="1.0.0"
+)
+
+# CORS básico
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Routers
+app.include_router(api_router, prefix="/api/v1")
+app.include_router(ws_router)
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+```
+
+```python
+# src/api/v1/router.py
+from fastapi import APIRouter
+
+from src.api.v1.upload.router import router as upload_router
+from src.api.v1.projects.router import router as projects_router
+from src.api.v1.library.router import router as library_router
+from src.api.v1.mix.router import router as mix_router
+
+api_router = APIRouter()
+
+api_router.include_router(upload_router)
+api_router.include_router(projects_router)
+api_router.include_router(library_router)
+api_router.include_router(mix_router)
+```
+
+---
+
+## 14. Cronograma Simplificado
+
+| Semana | Atividades |
+|--------|------------|
+| **1** | Setup projeto, Docker Compose, estrutura de pastas, banco de dados |
+| **2** | Endpoints de upload, integração MinIO, validação de arquivos |
+| **3** | Wrapper Demucs, task de separação, worker GPU |
+| **4** | Serviços de análise (onset + pitch), cache Redis |
+| **5** | Construtor de biblioteca de grãos, serialização |
+| **6** | Sintetizador granular (extração do notebook) |
+| **7** | Mixer, endpoints de mixagem, task de síntese |
+| **8** | WebSocket para notificações, integração completa |
+| **9-10** | Testes manuais, ajustes, documentação |
+
+---
+
+## 15. Resumo dos Endpoints
+
+| Método | Endpoint | Descrição |
+|--------|----------|-----------|
+| POST | `/api/v1/upload/base-track` | Upload música base |
+| POST | `/api/v1/upload/style-sound` | Upload sons de estilo |
+| GET | `/api/v1/projects` | Listar projetos |
+| GET | `/api/v1/projects/{id}` | Detalhes projeto |
+| GET | `/api/v1/projects/{id}/status` | Status separação |
+| DELETE | `/api/v1/projects/{id}` | Remover projeto |
+| GET | `/api/v1/library` | Listar biblioteca |
+| GET | `/api/v1/library/{id}` | Detalhes som |
+| DELETE | `/api/v1/library/{id}` | Remover som |
+| POST | `/api/v1/mix` | Criar mixagem |
+| GET | `/api/v1/mix/{id}` | Status mixagem |
+| GET | `/api/v1/mix/{id}/download` | Download resultado |
+| WS | `/ws/project/{id}` | Notificações projeto |
+| WS | `/ws/mix/{id}` | Notificações mixagem |
+
+---
+
+## 16. Comandos para Iniciar
+
+```bash
+# Clone e setup
+git clone <repo>
+cd audio-mixer-backend
+
+# Criar .env
+cp .env.example .env
+
+# Subir serviços
+docker-compose up -d
+
+# Verificar logs
+docker-compose logs -f api
+docker-compose logs -f worker-cpu
+docker-compose logs -f worker-gpu
+
+# Acessar API
+curl http://localhost:8000/health
+
+# Console MinIO
+# http://localhost:9001 (minioadmin/minioadmin)
+```
+
+---
+
+Este plano simplificado contém apenas o essencial para colocar o sistema em funcionamento: estrutura de código, serviços de processamento de áudio, endpoints da API, tasks assíncronas e infraestrutura Docker.

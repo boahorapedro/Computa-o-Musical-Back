@@ -1,0 +1,31 @@
+# API Framework
+fastapi==0.109.0
+uvicorn==0.27.0
+
+# Task Queue
+celery==5.3.4
+redis==5.0.1
+
+# Database
+sqlalchemy==2.0.25
+asyncpg==0.29.0
+psycopg2-binary==2.9.9
+
+# Validation & Settings
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# Audio Processing
+librosa==0.10.1
+numpy==1.26.3
+soundfile==0.12.1
+demucs==4.0.1
+torch==2.1.2
+torchaudio==2.1.2
+
+# Storage
+minio==7.2.3
+python-multipart==0.0.6
+
+# Utils
+python-dotenv==1.0.0
