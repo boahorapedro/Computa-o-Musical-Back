@@ -1,4 +1,4 @@
-# src/tasks/separation.py
+# src/tasks/separation.py - VERSÃO CORRIGIDA
 from src.tasks.celery_app import celery_app
 from src.services.stem_separator import StemSeparator
 from src.storage.minio_client import MinIOClient
@@ -8,20 +8,18 @@ import os
 import asyncio
 
 
-@celery_app.task(bind=True, name="tasks.separate_stems")
-def separate_stems(self, project_id: str):
-    """Task to separate stems from a music file."""
-
+async def _separate_stems_async(project_id: str):
+    """Async helper to separate stems."""
     storage = MinIOClient()
     repo = ProjectRepository()
     separator = StemSeparator()
 
     # Update status
-    asyncio.run(repo.update_status(project_id, "separating"))
+    await repo.update_status(project_id, "separating")
 
     try:
         # Fetch project
-        project = asyncio.run(repo.get_by_id(project_id))
+        project = await repo.get_by_id(project_id)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             # Download base file
@@ -39,11 +37,18 @@ def separate_stems(self, project_id: str):
                 stem_paths[stem_name] = remote_path
 
             # Update project
-            asyncio.run(repo.update_stems(project_id, stem_paths))
-            asyncio.run(repo.update_status(project_id, "ready"))
+            await repo.update_stems(project_id, stem_paths)
+            await repo.update_status(project_id, "ready")
 
         return {"status": "success", "project_id": project_id}
 
     except Exception as e:
-        asyncio.run(repo.update_status(project_id, "error"))
+        await repo.update_status(project_id, "error")
         raise e
+
+
+@celery_app.task(bind=True, name="tasks.separate_stems")
+def separate_stems(self, project_id: str):
+    """Task to separate stems from a music file."""
+    # Run async code in a single event loop
+    return asyncio.run(_separate_stems_async(project_id))

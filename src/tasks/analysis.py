@@ -1,4 +1,4 @@
-# src/tasks/analysis.py
+# src/tasks/analysis.py - VERSÃO CORRIGIDA
 from src.tasks.celery_app import celery_app
 from src.services.onset_detector import OnsetDetector
 from src.services.pitch_analyzer import PitchAnalyzer
@@ -11,15 +11,13 @@ import tempfile
 import asyncio
 
 
-@celery_app.task(name="tasks.analyze_stems")
-def analyze_stems(project_id: str):
-    """Analyze onsets and pitch of each stem."""
-
+async def _analyze_stems_async(project_id: str):
+    """Async helper to analyze stems."""
     storage = MinIOClient()
     cache = RedisCache()
     repo = ProjectRepository()
 
-    project = asyncio.run(repo.get_by_id(project_id))
+    project = await repo.get_by_id(project_id)
 
     onset_detector = OnsetDetector()
     pitch_analyzer = PitchAnalyzer()
@@ -53,20 +51,25 @@ def analyze_stems(project_id: str):
     cache_key = f"analysis:{project_id}"
     cache.set_json(cache_key, analysis_results)
 
-    asyncio.run(repo.update(project_id, {"analysis_cache_key": cache_key}))
+    await repo.update(project_id, {"analysis_cache_key": cache_key})
 
     return {"status": "success", "cache_key": cache_key}
 
 
-@celery_app.task(name="tasks.build_grain_library")
-def build_grain_library(style_sound_id: str):
-    """Build grain library from style sound file."""
+@celery_app.task(name="tasks.analyze_stems")
+def analyze_stems(project_id: str):
+    """Analyze onsets and pitch of each stem."""
+    # Run async code in a single event loop
+    return asyncio.run(_analyze_stems_async(project_id))
 
+
+async def _build_grain_library_async(style_sound_id: str):
+    """Async helper to build grain library."""
     storage = MinIOClient()
     cache = RedisCache()
     repo = StyleSoundRepository()
 
-    style = asyncio.run(repo.get_by_id(style_sound_id))
+    style = await repo.get_by_id(style_sound_id)
 
     builder = GrainBuilder()
 
@@ -85,14 +88,21 @@ def build_grain_library(style_sound_id: str):
     cache.set_grains(cache_key, grains)
 
     # Update database
-    asyncio.run(repo.update(style_sound_id, {
+    await repo.update(style_sound_id, {
         "grain_cache_key": cache_key,
         "grain_count": len(grains),
         "duration_seconds": duration
-    }))
+    })
 
     return {
         "status": "success",
         "cache_key": cache_key,
         "grain_count": len(grains)
     }
+
+
+@celery_app.task(name="tasks.build_grain_library")
+def build_grain_library(style_sound_id: str):
+    """Build grain library from style sound file."""
+    # Run async code in a single event loop
+    return asyncio.run(_build_grain_library_async(style_sound_id))
